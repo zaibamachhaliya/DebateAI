@@ -131,10 +131,14 @@ func setupRouter(cfg *config.Config) *gin.Engine {
 		routes.SetupTeamDebateRoutes(auth)
 		routes.SetupTeamChatRoutes(auth)
 		routes.SetupTeamMatchmakingRoutes(auth)
+
 		log.Println("Team routes registered")
 
 		routes.SetupCommunityRoutes(auth)
 		log.Println("Community routes registered")
+
+		routes.SetupTournamentRoutes(auth)
+		log.Println("Tournament routes registered")
 
 		auth.GET("/notifications", routes.GetNotificationsRouteHandler)
 		auth.PUT("/notifications/:id/read", routes.MarkNotificationAsReadRouteHandler)
