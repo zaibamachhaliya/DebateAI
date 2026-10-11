@@ -13,8 +13,12 @@ func SetupTournamentRoutes(router *gin.RouterGroup) {
 	// Private Tournament Join (Request)
 	router.POST("/tournaments/join", controllers.JoinPrivateTournament)
 
-	// Moderator APIs
+	// CHOOSE STANCE
+	router.PATCH("/tournaments/:id/stance", controllers.ChooseStance)
+
+	// MODERATOR: GET PENDING REQUESTS
 	router.GET("/tournaments/:id/requests", controllers.GetPendingRequests)
-	router.POST("/tournaments/:id/requests/:userId/approve", controllers.ApproveJoinRequest)
-	router.POST("/tournaments/:id/requests/:userId/reject", controllers.RejectJoinRequest)
+
+	// MODERATOR: MANAGE REQUEST (APPROVE/REJECT)
+	router.PATCH("/tournaments/:id/request/:userId", controllers.ManageJoinRequest)
 }

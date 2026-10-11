@@ -71,16 +71,22 @@ func JoinPublicTournament(c *gin.Context) {
 	}
 
 	for _, p := range tournament.Participants {
-		if p.Hex() == userObjID.Hex() {
+		if p.UserID.Hex() == userObjID.Hex() { // ← YEH CHANGE KARO
 			c.JSON(http.StatusBadRequest, gin.H{"error": "You are already in this tournament"})
 			return
 		}
 	}
 
+	newParticipant := models.TournamentParticipant{
+		UserID: userObjID,
+		Name:   "", // Ya user ka naam
+		Stance: "",
+	}
+
 	_, err = db.TournamentCollection.UpdateOne(
 		context.Background(),
 		bson.M{"_id": objID},
-		bson.M{"$push": bson.M{"participants": userObjID}},
+		bson.M{"$push": bson.M{"participants": newParticipant}},
 	)
 
 	if err != nil {
@@ -132,7 +138,7 @@ func JoinPrivateTournament(c *gin.Context) {
 	}
 
 	for _, p := range tournament.Participants {
-		if p.Hex() == userObjID.Hex() {
+		if p.UserID.Hex() == userObjID.Hex() { // ← YEH CHANGE KARO
 			c.JSON(http.StatusBadRequest, gin.H{"error": "You are already in this tournament"})
 			return
 		}
@@ -237,12 +243,109 @@ func GetPendingRequests(c *gin.Context) {
 }
 
 // ============================================
-// MODERATOR: APPROVE REQUEST
+// CHOOSE STANCE
 // ============================================
 
-func ApproveJoinRequest(c *gin.Context) {
+func ChooseStance(c *gin.Context) {
+	tournamentID := c.Param("id")
+
+	var req struct {
+		Stance string `json:"stance" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Stance is required"})
+		return
+	}
+
+	// Validate stance
+	if req.Stance != "for" && req.Stance != "against" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Stance must be 'for' or 'against'"})
+		return
+	}
+
+	userObjID, err := getUserIDFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	objID, err := primitive.ObjectIDFromHex(tournamentID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tournament ID"})
+		return
+	}
+
+	// Check user is participant
+	var tournament models.Tournament
+	err = db.TournamentCollection.FindOne(
+		context.Background(),
+		bson.M{"_id": objID},
+	).Decode(&tournament)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Tournament not found"})
+		return
+	}
+
+	// Check user in participants
+	isParticipant := false
+	for _, p := range tournament.Participants {
+		if p.UserID.Hex() == userObjID.Hex() {
+			isParticipant = true
+			break
+		}
+	}
+
+	if !isParticipant {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You are not a participant of this tournament"})
+		return
+	}
+
+	// Update stance
+	_, err = db.TournamentCollection.UpdateOne(
+		context.Background(),
+		bson.M{
+			"_id":                 objID,
+			"participants.userId": userObjID,
+		},
+		bson.M{"$set": bson.M{"participants.$.stance": req.Stance}},
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update stance"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Stance updated successfully",
+		"stance":  req.Stance,
+	})
+}
+
+// ============================================
+// MODERATOR: MANAGE REQUEST (APPROVE/REJECT)
+// ============================================
+
+func ManageJoinRequest(c *gin.Context) {
 	tournamentID := c.Param("id")
 	requestUserID := c.Param("userId")
+
+	// Body se action lo (approve ya reject)
+	var req struct {
+		Action string `json:"action" binding:"required"` // "approve" ya "reject"
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Action is required (approve/reject)"})
+		return
+	}
+
+	// Validate action
+	if req.Action != "approve" && req.Action != "reject" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Action must be 'approve' or 'reject'"})
+		return
+	}
 
 	objID, err := primitive.ObjectIDFromHex(tournamentID)
 	if err != nil {
@@ -273,17 +376,13 @@ func ApproveJoinRequest(c *gin.Context) {
 		return
 	}
 
+	// Check moderator
 	if tournament.ModeratorID.Hex() != userObjID.Hex() {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only moderator can approve requests"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only moderator can manage requests"})
 		return
 	}
 
-	// IMPORTANT: Full check (mentor ne bola tha)
-	if len(tournament.Participants) >= tournament.MaxParticipants {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tournament is full. Cannot approve more requests."})
-		return
-	}
-
+	// Request exist check
 	requestFound := false
 	for _, r := range tournament.JoinRequests {
 		if r.UserID.Hex() == requestUserObjID.Hex() && r.Status == "pending" {
@@ -297,101 +396,80 @@ func ApproveJoinRequest(c *gin.Context) {
 		return
 	}
 
-	_, err = db.TournamentCollection.UpdateOne(
-		context.Background(),
-		bson.M{"_id": objID},
-		bson.M{
-			"$push": bson.M{"participants": requestUserObjID},
-			"$set":  bson.M{"joinRequests.$[elem].status": "approved"},
-		},
-		options.Update().SetArrayFilters(options.ArrayFilters{
-			Filters: []interface{}{
-				bson.M{"elem.userId": requestUserObjID, "elem.status": "pending"},
+	// ========== APPROVE ==========
+	if req.Action == "approve" {
+		// Full check (mentor ne bola tha)
+		if len(tournament.Participants) >= tournament.MaxParticipants {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Tournament is full. Cannot approve more requests."})
+			return
+		}
+
+		newParticipant := models.TournamentParticipant{
+			UserID: requestUserObjID,
+			Name:   "",
+			Stance: "",
+		}
+
+		_, err = db.TournamentCollection.UpdateOne(
+			context.Background(),
+			bson.M{"_id": objID},
+			bson.M{
+				"$push": bson.M{"participants": newParticipant},
+				"$set":  bson.M{"joinRequests.$[elem].status": "approved"},
 			},
-		}),
-	)
+			options.Update().SetArrayFilters(options.ArrayFilters{
+				Filters: []interface{}{
+					bson.M{"elem.userId": requestUserObjID, "elem.status": "pending"},
+				},
+			}),
+		)
 
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve request"})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve request"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Request approved successfully",
+			"userId":  requestUserID,
+			"action":  "approve",
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Request approved successfully",
-		"userId":  requestUserID,
-	})
-}
-
-// ============================================
-// MODERATOR: REJECT REQUEST
-// ============================================
-
-func RejectJoinRequest(c *gin.Context) {
-	tournamentID := c.Param("id")
-	requestUserID := c.Param("userId")
-
-	objID, err := primitive.ObjectIDFromHex(tournamentID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tournament ID"})
-		return
-	}
-
-	requestUserObjID, err := primitive.ObjectIDFromHex(requestUserID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
-		return
-	}
-
-	userObjID, err := getUserIDFromContext(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
-		return
-	}
-
-	var tournament models.Tournament
-	err = db.TournamentCollection.FindOne(
-		context.Background(),
-		bson.M{"_id": objID},
-	).Decode(&tournament)
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Tournament not found"})
-		return
-	}
-
-	if tournament.ModeratorID.Hex() != userObjID.Hex() {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only moderator can reject requests"})
-		return
-	}
-
-	result, err := db.TournamentCollection.UpdateOne(
-		context.Background(),
-		bson.M{
-			"_id": objID,
-			"joinRequests": bson.M{
-				"$elemMatch": bson.M{"userId": requestUserObjID, "status": "pending"},
+	// ========== REJECT ==========
+	if req.Action == "reject" {
+		result, err := db.TournamentCollection.UpdateOne(
+			context.Background(),
+			bson.M{
+				"_id": objID,
+				"joinRequests": bson.M{
+					"$elemMatch": bson.M{"userId": requestUserObjID, "status": "pending"},
+				},
 			},
-		},
-		bson.M{"$set": bson.M{"joinRequests.$[elem].status": "rejected"}},
-		options.Update().SetArrayFilters(options.ArrayFilters{
-			Filters: []interface{}{
-				bson.M{"elem.userId": requestUserObjID, "elem.status": "pending"},
-			},
-		}),
-	)
+			bson.M{"$set": bson.M{"joinRequests.$[elem].status": "rejected"}},
+			options.Update().SetArrayFilters(options.ArrayFilters{
+				Filters: []interface{}{
+					bson.M{"elem.userId": requestUserObjID, "elem.status": "pending"},
+				},
+			}),
+		)
 
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reject request"})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reject request"})
+			return
+		}
+
+		if result.MatchedCount == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Pending request not found"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Request rejected successfully",
+			"userId":  requestUserID,
+			"action":  "reject",
+		})
 		return
 	}
-
-	if result.MatchedCount == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Pending request not found"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Request rejected successfully",
-		"userId":  requestUserID,
-	})
 }
