@@ -1,6 +1,7 @@
-import config from "../config/config";
+// import config from "../config/config";
+import config, { getWebSocketBaseUrl } from "../config/config";
 import { useEffect, useRef } from 'react';
-import { useAtom } from 'jotai';
+import { useAtom, useStore } from 'jotai';
 import {
   wsAtom,
   debateIdAtom,
@@ -22,7 +23,8 @@ interface Event {
 }
 
 export const useDebateWS = (debateId: string | null) => {
-  const [ws, setWs] = useAtom(wsAtom);
+  const [, setWs] = useAtom(wsAtom);
+  const store = useStore();
   const [, setDebateId] = useAtom(debateIdAtom);
   const [, setPollState] = useAtom(pollStateAtom);
   const [, setQuestions] = useAtom(questionsAtom);
@@ -42,8 +44,9 @@ export const useDebateWS = (debateId: string | null) => {
       return;
     }
 
-    if (ws) {
-      const existing = ws as unknown as ReconnectingWebSocket;
+    const currentSocket = store.get(wsAtom);
+    if (currentSocket) {
+      const existing = currentSocket as unknown as ReconnectingWebSocket;
       if (
         existing.readyState === WebSocket.CLOSING ||
         existing.readyState === WebSocket.CLOSED
@@ -62,29 +65,14 @@ export const useDebateWS = (debateId: string | null) => {
       }
     }
 
-    setWsStatus('connecting');
-
-    // Get WebSocket URL
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const apiUrl = config.baseUrl;
-    let host = window.location.host;
-    if (apiUrl) {
-      try {
-        host = new URL(apiUrl).host;
-      } catch {
-        host = apiUrl.replace(/^https?:\/\//, '');
-      }
-    }
-
     let spectatorId = localStorage.getItem('spectatorId');
     if (!spectatorId) {
       spectatorId = crypto.randomUUID();
       localStorage.setItem('spectatorId', spectatorId);
     }
 
-    const wsUrl = `${protocol}//${host}/ws/debate/${debateId}${
-      spectatorId ? `?spectatorId=${spectatorId}` : ''
-    }`;
+    const wsUrl = `${getWebSocketBaseUrl(config.baseUrl)}/ws/debate/${debateId}${spectatorId ? `?spectatorId=${spectatorId}` : ''
+      }`;
 
     const rws = new ReconnectingWebSocket(wsUrl, [], {
       connectionTimeout: 4000,
@@ -96,6 +84,7 @@ export const useDebateWS = (debateId: string | null) => {
 
     wsRef.current = rws;
     setWs(rws as unknown as WebSocket);
+    setWsStatus('connecting');
     let ownsConnection = true;
 
     rws.onopen = () => {
@@ -240,8 +229,8 @@ export const useDebateWS = (debateId: string | null) => {
                 });
                 const options = Array.isArray(poll.options)
                   ? poll.options
-                      .map((opt: unknown) => String(opt ?? '').trim())
-                      .filter((opt: string) => opt.length > 0)
+                    .map((opt: unknown) => String(opt ?? '').trim())
+                    .filter((opt: string) => opt.length > 0)
                   : Object.keys(counts);
                 return {
                   ...prev,
@@ -303,10 +292,6 @@ export const useDebateWS = (debateId: string | null) => {
 
     rws.onclose = () => {
       setWsStatus('disconnected');
-      setWs(null);
-      if (wsRef.current === rws) {
-        wsRef.current = null;
-      }
     };
 
     return () => {
@@ -323,7 +308,7 @@ export const useDebateWS = (debateId: string | null) => {
   }, [
     debateId,
     spectatorHash,
-    ws,
+    store,
     setWs,
     setDebateId,
     setPollState,
@@ -346,4 +331,3 @@ export const useDebateWS = (debateId: string | null) => {
     ws: wsRef.current,
   };
 };
-

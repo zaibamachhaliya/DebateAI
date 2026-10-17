@@ -45,7 +45,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [token, setToken] = useState<string | null>(
     localStorage.getItem('token')
   );
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() =>
+    Boolean(localStorage.getItem('token'))
+  );
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
   const setUser = useSetAtom(userAtom);
@@ -64,12 +66,22 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setError(message);
   }, []);
 
+  const clearSession = useCallback(() => {
+    setToken(null);
+    localStorage.removeItem('token');
+    localStorage.removeItem(USER_CACHE_KEY);
+    setUser(null);
+  }, [setUser]);
+
 const currentRequest = useRef(0);
 const verifyToken = useCallback(async () => {
   const requestId = ++currentRequest.current;
 
   const storedToken = localStorage.getItem('token');
-  if (!storedToken) return;
+if (!storedToken) {
+  setLoading(false);
+  return;
+}
 
   try {
     const response = await fetch(`${baseURL}/verifyToken`, {
@@ -81,9 +93,7 @@ const verifyToken = useCallback(async () => {
     if (requestId !== currentRequest.current) return;
 
     if (!response.ok) {
-      localStorage.removeItem('token');
-      setToken(null);
-      setUser(null);
+      clearSession();
       navigate('/auth');
       return;
     }
@@ -138,16 +148,26 @@ const verifyToken = useCallback(async () => {
   } catch (error) {
     if (requestId !== currentRequest.current) return;
 
-    console.log('error', error);
-    logout();
+    if (error instanceof TypeError) {
+      setError('Unable to reach the sign-in server. Check your connection and try again.');
+    } else {
+      console.error('Failed to verify the saved login session:', error);
+      clearSession();
+      navigate('/auth');
+    }
+  } finally {
+    if (requestId === currentRequest.current) {
+      setLoading(false);
+    }
   }
-}, [setUser]);
+}, [clearSession, navigate, setUser]);
   
   useEffect(() => {
     verifyToken();
   }, [verifyToken]);
 
   const login = async (email: string, password: string) => {
+    ++currentRequest.current;
     setLoading(true);
     setError(null);
     try {
@@ -159,6 +179,9 @@ const verifyToken = useCallback(async () => {
 
       const data = await response.json().catch(() => ({}));
         if (!response.ok) {
+          if (response.status === 401) {
+            clearSession();
+          }
           const message = data.error || data.message || 'Login failed';
           const err = new Error(message) as Error & { code?: string };
           if (data.code === 'EMAIL_NOT_VERIFIED') {
@@ -166,6 +189,10 @@ const verifyToken = useCallback(async () => {
           }
           throw err;
         }
+
+      if (typeof data.accessToken !== 'string' || !data.accessToken) {
+        throw new Error('Sign-in server returned no access token. Please try again.');
+      }
 
       setToken(data.accessToken);
       localStorage.setItem('token', data.accessToken);
@@ -357,6 +384,7 @@ const verifyToken = useCallback(async () => {
   };
 
   const googleLogin = async (idToken: string) => {
+    ++currentRequest.current;
     setLoading(true);
     setError(null);
     try {
@@ -367,7 +395,14 @@ const verifyToken = useCallback(async () => {
       });
 
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || data.message || 'Google login failed');
+      if (!response.ok) {
+        const message = [data.error, data.hint].filter(Boolean).join('. ');
+        throw new Error(message || 'Google login failed');
+      }
+
+      if (typeof data.accessToken !== 'string' || !data.accessToken) {
+        throw new Error('Sign-in server returned no access token. Please try again.');
+      }
 
       setToken(data.accessToken);
       localStorage.setItem('token', data.accessToken);
@@ -410,10 +445,7 @@ const verifyToken = useCallback(async () => {
   const logout = () => {
     ++currentRequest.current;
     setError(null);
-    setToken(null);
-    localStorage.removeItem('token');
-    localStorage.removeItem(USER_CACHE_KEY);
-    setUser(null); // Clear userAtom on logout
+    clearSession();
     navigate('/auth');
   };
 

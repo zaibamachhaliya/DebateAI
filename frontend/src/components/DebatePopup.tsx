@@ -1,19 +1,22 @@
 import config from "../config/config";
-import React, { useState } from 'react';
+import React, { useContext, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { X } from 'lucide-react';
 import RoomBrowser from './RoomBrowser';
 import Matchmaking from './Matchmaking';
+import { AuthContext } from '../context/authContext';
 
 interface DebatePopupProps {
   onClose: () => void;
 }
 
-const baseURL = config.baseUrl || 'http://localhost:1313';
+const baseURL = (config.baseUrl || 'http://localhost:1313').replace(/\/+$/, '');
 
 const DebatePopup: React.FC<DebatePopupProps> = ({ onClose }) => {
   const navigate = useNavigate();
+  const authContext = useContext(AuthContext);
   const [roomCode, setRoomCode] = useState('');
+  const [isCreatingRoom, setIsCreatingRoom] = useState(false);
   const [activeTab, setActiveTab] = useState<'create' | 'join' | 'matchmaking'>(
     'create'
   );
@@ -56,6 +59,13 @@ const DebatePopup: React.FC<DebatePopupProps> = ({ onClose }) => {
   // Handler to create a new room by sending a POST request to the backend.
   const handleCreateRoom = async () => {
     const token = localStorage.getItem('token');
+    if (!token) {
+      alert('Please sign in again.');
+      return;
+    }
+    if (isCreatingRoom) return;
+
+    setIsCreatingRoom(true);
     try {
       // Sending a POST request to create a new room.
       // You might also send additional parameters (e.g., room type, settings).
@@ -68,15 +78,36 @@ const DebatePopup: React.FC<DebatePopupProps> = ({ onClose }) => {
         // Here we send an example payload with the room type.
         body: JSON.stringify({ type: 'public' }),
       });
+      const data = await response.json().catch(() => null);
       if (!response.ok) {
-        alert('Error creating room.');
+        if (response.status === 401) {
+          alert('Your login session is no longer valid. Please sign in again.');
+          authContext?.logout();
+          return;
+        }
+        alert(
+          data?.error ||
+            `Could not create room (server returned ${response.status}).`
+        );
         return;
       }
-      const room = await response.json();
-      navigate(`/debate-room/${room.id}`);
+
+      if (typeof data?.id !== 'string' || data.id.length === 0) {
+        throw new Error('The server created no room code. Please try again.');
+      }
+
+      navigate(`/debate-room/${encodeURIComponent(data.id)}`);
       onClose();
-    } catch {
-      alert('Error creating room.');
+    } catch (error) {
+      alert(
+        error instanceof TypeError
+          ? 'Cannot reach the debate server. Check your internet connection and VITE_BASE_URL.'
+          : error instanceof Error
+          ? error.message
+          : 'Could not create the room. Please try again.'
+      );
+    } finally {
+      setIsCreatingRoom(false);
     }
   };
 
@@ -134,9 +165,10 @@ const DebatePopup: React.FC<DebatePopupProps> = ({ onClose }) => {
             </p>
             <button
               onClick={handleCreateRoom}
-              className='bg-primary text-primary-foreground px-6 py-3 rounded-lg hover:bg-primary/90 transition w-full'
+              disabled={isCreatingRoom}
+              className='bg-primary text-primary-foreground px-6 py-3 rounded-lg hover:bg-primary/90 transition w-full disabled:cursor-not-allowed disabled:opacity-60'
             >
-              Create Room
+              {isCreatingRoom ? 'Creating Room...' : 'Create Room'}
             </button>
           </div>
         )}

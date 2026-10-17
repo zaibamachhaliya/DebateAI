@@ -2,8 +2,11 @@ package routes
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"errors"
+	"log"
 	"math"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"strconv"
 	"time"
@@ -35,13 +38,15 @@ type Participant struct {
 	Email     string `json:"email" bson:"email,omitempty"`
 }
 
-// generateRoomID creates a random six-digit room ID as a string.
-func generateRoomID() string {
-	rand.Seed(time.Now().UnixNano())
-	return strconv.Itoa(rand.Intn(900000) + 100000)
+// generateRoomID creates a cryptographically random six-digit room ID.
+func generateRoomID() (string, error) {
+	value, err := cryptorand.Int(cryptorand.Reader, big.NewInt(900000))
+	if err != nil {
+		return "", err
+	}
+	return strconv.Itoa(int(value.Int64()) + 100000), nil
 }
 
-// CreateRoomHandler handles POST /rooms and creates a new debate room.
 // CreateRoomHandler handles POST /rooms and creates a new debate room.
 func CreateRoomHandler(c *gin.Context) {
 	type CreateRoomInput struct {
@@ -89,7 +94,12 @@ func CreateRoomHandler(c *gin.Context) {
 
 	err := userCollection.FindOne(ctx, bson.M{"email": emailStr}).Decode(&user)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return
+		}
+		log.Printf("[rooms] failed to load room creator: err=%v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load user"})
 		return
 	}
 
@@ -102,22 +112,36 @@ func CreateRoomHandler(c *gin.Context) {
 		Email:     user.Email,
 	}
 
-	roomID := generateRoomID()
-	newRoom := Room{
-		ID:           roomID,
-		Type:         input.Type,
-		OwnerID:      creatorParticipant.ID,
-		Participants: []Participant{creatorParticipant},
-	}
-
 	roomCollection := db.MongoDatabase.Collection("rooms")
-	_, err = roomCollection.InsertOne(ctx, newRoom)
-	if err != nil {
+	for attempt := 0; attempt < 5; attempt++ {
+		roomID, err := generateRoomID()
+		if err != nil {
+			log.Printf("[rooms] failed to generate room ID: err=%v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create room"})
+			return
+		}
+
+		newRoom := Room{
+			ID:           roomID,
+			Type:         input.Type,
+			OwnerID:      creatorParticipant.ID,
+			Participants: []Participant{creatorParticipant},
+		}
+		if _, err = roomCollection.InsertOne(ctx, newRoom); err == nil {
+			c.JSON(http.StatusCreated, newRoom)
+			return
+		}
+		if mongo.IsDuplicateKeyError(err) {
+			continue
+		}
+
+		log.Printf("[rooms] failed to insert room: room=%s err=%v", roomID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create room"})
 		return
 	}
 
-	c.JSON(http.StatusOK, newRoom)
+	log.Printf("[rooms] failed to create room after repeated room ID collisions")
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Could not generate a unique room code. Please try again."})
 }
 
 // GetRoomsHandler handles GET /rooms and returns all rooms.
@@ -189,7 +213,18 @@ func JoinRoomHandler(c *gin.Context) {
 
 	// Use atomic operation to join room
 	roomCollection := db.MongoDatabase.Collection("rooms")
-	filter := bson.M{"_id": roomId}
+	filter := bson.M{
+		"_id": roomId,
+		"$or": bson.A{
+			bson.M{"participants.id": participant.ID},
+			bson.M{"$expr": bson.M{
+				"$lt": bson.A{
+					bson.M{"$size": bson.M{"$ifNull": bson.A{"$participants", bson.A{}}}},
+					2,
+				},
+			}},
+		},
+	}
 	update := mongo.Pipeline{
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "participants", Value: bson.D{{Key: "$cond", Value: bson.A{
@@ -214,6 +249,21 @@ func JoinRoomHandler(c *gin.Context) {
 
 	var updatedRoom Room
 	if err := roomCollection.FindOneAndUpdate(ctx, filter, update, opts).Decode(&updatedRoom); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			var existingRoom struct {
+				ID string `bson:"_id"`
+			}
+			if lookupErr := roomCollection.FindOne(ctx, bson.M{"_id": roomId}).Decode(&existingRoom); errors.Is(lookupErr, mongo.ErrNoDocuments) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Room not found"})
+				return
+			} else if lookupErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not join room"})
+				return
+			}
+
+			c.JSON(http.StatusConflict, gin.H{"error": "Room is full"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not join room"})
 		return
 	}

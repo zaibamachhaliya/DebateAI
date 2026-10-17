@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"arguehub/config"
 	"arguehub/db"
@@ -19,7 +20,8 @@ import (
 )
 
 func main() {
-	cfg, err := config.LoadConfig("./config/config.prod.yml")
+	configPath := getConfigPath()
+	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		panic("Failed to load config: " + err.Error())
 	}
@@ -37,7 +39,7 @@ func main() {
 		log.Fatalf("Failed to ensure indexes: %v", err)
 	}
 
-	if err := middlewares.InitCasbin("./config/config.prod.yml"); err != nil {
+	if err := middlewares.InitCasbin(configPath); err != nil {
 		log.Fatalf("Failed to initialize Casbin: %v", err)
 	}
 	log.Println("Casbin RBAC initialized")
@@ -73,13 +75,20 @@ func main() {
 	}
 }
 
+func getConfigPath() string {
+	if configPath := os.Getenv("CONFIG_PATH"); configPath != "" {
+		return configPath
+	}
+	return "./config/config.prod.yml"
+}
+
 func setupRouter(cfg *config.Config) *gin.Engine {
 	router := gin.Default()
 
 	router.SetTrustedProxies([]string{"127.0.0.1", "localhost"})
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:5173"},
+		AllowOrigins:     getAllowedOrigins(),
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -102,7 +111,7 @@ func setupRouter(cfg *config.Config) *gin.Engine {
 	router.GET("/ws/gamification", websocket.GamificationWebSocketHandler)
 
 	auth := router.Group("/")
-	auth.Use(middlewares.AuthMiddleware("./config/config.prod.yml"))
+	auth.Use(middlewares.AuthMiddleware(getConfigPath()))
 	{
 		auth.GET("/user/fetchprofile", routes.GetProfileRouteHandler)
 		auth.PUT("/user/updateprofile", routes.UpdateProfileRouteHandler)
@@ -148,9 +157,28 @@ func setupRouter(cfg *config.Config) *gin.Engine {
 
 	router.GET("/ws/team", websocket.TeamWebsocketHandler)
 
-	routes.SetupAdminRoutes(router, "./config/config.prod.yml")
+	routes.SetupAdminRoutes(router, getConfigPath())
 	log.Println("Admin routes registered")
 
 	router.GET("/ws/debate/:debateID", websocket.DebateWebsocketHandler)
 	return router
+}
+
+func getAllowedOrigins() []string {
+	origins := []string{"http://localhost:5173"}
+	seen := map[string]struct{}{origins[0]: {}}
+
+	for _, origin := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		origin = strings.TrimSpace(origin)
+		if origin == "" {
+			continue
+		}
+		if _, exists := seen[origin]; exists {
+			continue
+		}
+		origins = append(origins, origin)
+		seen[origin] = struct{}{}
+	}
+
+	return origins
 }

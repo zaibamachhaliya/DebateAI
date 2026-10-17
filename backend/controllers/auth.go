@@ -43,15 +43,33 @@ func GoogleLogin(ctx *gin.Context) {
 		return
 	}
 
+	if cfg.GoogleOAuth.ClientID == "" {
+		log.Printf("[auth] Google login is unavailable: Google OAuth client ID is not configured")
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Google login is not configured on the server",
+		})
+		return
+	}
+
 	payload, err := idtoken.Validate(ctx, request.IDToken, cfg.GoogleOAuth.ClientID)
 	if err != nil {
-		ctx.JSON(401, gin.H{"error": "Invalid Google ID token", "message": err.Error()})
+		log.Printf("[auth] Google ID token validation failed: %v", err)
+		ctx.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Google ID token was rejected",
+			"hint":  "Check that the frontend VITE_GOOGLE_CLIENT_ID and backend GOOGLE_CLIENT_ID use the same OAuth Web client ID, and that this frontend origin is authorized in Google Cloud Console.",
+		})
 		return
 	}
 
 	email, ok := payload.Claims["email"].(string)
+	email = strings.ToLower(strings.TrimSpace(email))
 	if !ok || email == "" {
 		ctx.JSON(400, gin.H{"error": "Email not found in Google token"})
+		return
+	}
+	emailVerified, _ := payload.Claims["email_verified"].(bool)
+	if !emailVerified {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "Google account email is not verified"})
 		return
 	}
 	nickname, _ := payload.Claims["name"].(string)
@@ -304,7 +322,12 @@ func Login(ctx *gin.Context) {
 	var user models.User
 	err := db.MongoDatabase.Collection("users").FindOne(dbCtx, bson.M{"email": request.Email}).Decode(&user)
 	if err != nil {
-		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			ctx.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
+			return
+		}
+		log.Printf("[auth] failed to load user for email login: err=%v", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Unable to sign in right now. Please try again."})
 		return
 	}
 

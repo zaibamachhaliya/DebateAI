@@ -49,6 +49,7 @@ const RoomBrowser: React.FC = () => {
 
       setRooms(normalizedRooms);
     } catch (error) {
+      console.error('Failed to fetch debate rooms:', error);
     } finally {
       setLoading(false);
     }
@@ -74,11 +75,12 @@ const RoomBrowser: React.FC = () => {
         }
       );
       if (!response.ok) {
-        alert(`Failed to join room ${roomId}.`);
+        const data = await response.json().catch(() => null);
+        alert(data?.error || `Failed to join room ${roomId}.`);
         return;
       }
       navigate(`/debate-room/${roomId}`);
-    } catch (error) {
+    } catch {
       alert('An error occurred while joining the match.');
     }
   };

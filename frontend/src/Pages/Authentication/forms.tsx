@@ -2,9 +2,85 @@ import config from "../../config/config";
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { useContext, useState, useEffect } from 'react';
+import { useContext, useState, useEffect, useRef } from 'react';
 import { AuthContext } from '../../context/authContext';
 import { useCallback } from "react";
+
+const useGoogleSignInButton = (
+  buttonId: string,
+  buttonText: 'signin_with' | 'signup_with',
+  callback: (response: { credential: string; select_by: string }) => void
+) => {
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const callbackRef = useRef(callback);
+  useEffect(() => {
+    callbackRef.current = callback;
+  }, [callback]);
+
+  useEffect(() => {
+    const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim();
+    if (!clientId) {
+      setSetupError('Google sign-in is not configured for this frontend.');
+      return;
+    }
+
+    let cancelled = false;
+    let initialized = false;
+    let script = document.querySelector<HTMLScriptElement>(
+      'script[src="https://accounts.google.com/gsi/client"]'
+    );
+
+    const initialize = () => {
+      const google = window.google;
+      const buttonElement = document.getElementById(buttonId);
+      if (cancelled || !google?.accounts || !buttonElement) return;
+
+      google.accounts.id.initialize({
+        client_id: clientId,
+        callback: (response) => callbackRef.current(response),
+      });
+      google.accounts.id.renderButton(buttonElement, {
+        theme: 'outline',
+        size: 'large',
+        text: buttonText,
+        width: '100%',
+      });
+      initialized = true;
+      setSetupError(null);
+    };
+
+    function onScriptError() {
+      if (!cancelled) {
+        setSetupError('Could not load Google sign-in. Check your connection and try again.');
+      }
+    }
+
+    if (window.google?.accounts) {
+      initialize();
+    } else {
+      if (!script) {
+        script = document.createElement('script');
+        script.src = 'https://accounts.google.com/gsi/client';
+        script.async = true;
+        script.defer = true;
+        document.head.appendChild(script);
+      }
+      script.addEventListener('load', initialize);
+      script.addEventListener('error', onScriptError);
+    }
+
+    return () => {
+      cancelled = true;
+      script?.removeEventListener('load', initialize);
+      script?.removeEventListener('error', onScriptError);
+      if (initialized) {
+        window.google?.accounts.id.cancel();
+      }
+    };
+  }, [buttonId, buttonText]);
+
+  return setupError;
+};
 
 interface LoginFormProps {
   startForgotPassword: () => void;
@@ -28,7 +104,7 @@ export const LoginForm: React.FC<LoginFormProps> = ({ startForgotPassword, infoM
 
   useEffect(() => {
     clearError();
-  }, []);
+  }, [clearError]);
 
   const MIN_PASSWORD_LENGTH = 8;
   const handleSubmit = async (e: React.FormEvent) => {
@@ -39,18 +115,23 @@ export const LoginForm: React.FC<LoginFormProps> = ({ startForgotPassword, infoM
       return;
     }
     setLocalError(null);
+    const normalizedEmail = email.trim().toLowerCase();
     try {
-      await login(email, password);
+      await login(normalizedEmail, password);
     } catch (err) {
       const code = (err as Error & { code?: string }).code;
       if (code === 'EMAIL_NOT_VERIFIED') {
-        startOtpVerification(email);
+        startOtpVerification(normalizedEmail);
       }
     }
   };
 
   const handleGoogleLogin = useCallback(
     async (response: { credential: string; select_by: string }) => {
+      if (!response.credential) {
+        setLocalError('Google did not return a sign-in credential. Please try again.');
+        return;
+      }
       try {
         const idToken = response.credential;
         await googleLogin(idToken);
@@ -60,31 +141,11 @@ export const LoginForm: React.FC<LoginFormProps> = ({ startForgotPassword, infoM
     },
     [googleLogin]
   );
-  useEffect(() => {
-    const google = window.google;
-    if (!google?.accounts) {
-      return;
-    }
-
-    google.accounts.id.initialize({
-      client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
-      callback: handleGoogleLogin,
-    });
-
-    const buttonElement = document.getElementById('googleSignInButton');
-    if (buttonElement) {
-      google.accounts.id.renderButton(buttonElement, {
-        theme: 'outline',
-        size: 'large',
-        text: 'signin_with',
-        width: '100%',
-      });
-    }
-
-    return () => {
-      google.accounts.id.cancel();
-    };
-  }, [handleGoogleLogin]);
+  const googleSetupError = useGoogleSignInButton(
+    'googleSignInButton',
+    'signin_with',
+    handleGoogleLogin
+  );
 
   return (
     <form className="w-full" onSubmit={handleSubmit}>
@@ -137,6 +198,11 @@ export const LoginForm: React.FC<LoginFormProps> = ({ startForgotPassword, infoM
         {loading ? 'Signing In...' : 'Sign In With Email'}
       </Button>
       <div id="googleSignInButton" className="w-full"></div>
+      {googleSetupError && (
+        <p className="mt-2 text-sm text-red-500" role="alert">
+          {googleSetupError}
+        </p>
+      )}
     </form>
   );
 };
@@ -156,11 +222,11 @@ export const SignUpForm: React.FC<SignUpFormProps> = ({ startOtpVerification }) 
     throw new Error('SignUpForm must be used within an AuthProvider');
   }
 
-  const { signup, googleLogin, error, loading, clearError } = authContext;
+  const { signup, googleLogin, error, loading, clearError, handleError } = authContext;
 
   useEffect(() => {
     clearError();
-  }, []);
+  }, [clearError]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -170,9 +236,10 @@ export const SignUpForm: React.FC<SignUpFormProps> = ({ startOtpVerification }) 
       return;
     }
     clearError();
+    const normalizedEmail = email.trim().toLowerCase();
     try {
-      await signup(email, password);
-      startOtpVerification(email);
+      await signup(normalizedEmail, password);
+      startOtpVerification(normalizedEmail);
     } catch {
       // Handled by authContext error state
     }
@@ -180,6 +247,10 @@ export const SignUpForm: React.FC<SignUpFormProps> = ({ startOtpVerification }) 
 
   const handleGoogleLogin = useCallback(
     async (response: { credential: string; select_by: string }) => {
+      if (!response.credential) {
+        handleError('Google did not return a sign-in credential. Please try again.');
+        return;
+      }
       try {
         const idToken = response.credential;
         await googleLogin(idToken);
@@ -187,35 +258,14 @@ export const SignUpForm: React.FC<SignUpFormProps> = ({ startOtpVerification }) 
         // Handled by authContext error state
       }
     },
-    [googleLogin]
+    [googleLogin, handleError]
   );
 
-
-  useEffect(() => {
-    const google = window.google;
-    if (!google?.accounts) {
-      return;
-    }
-
-    google.accounts.id.initialize({
-      client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
-      callback: handleGoogleLogin,
-    });
-
-    const buttonElement = document.getElementById('googleSignUpButton');
-    if (buttonElement) {
-      google.accounts.id.renderButton(buttonElement, {
-        theme: 'outline',
-        size: 'large',
-        text: 'signup_with',
-        width: '100%',
-      });
-    }
-
-    return () => {
-      google.accounts.id.cancel();
-    };
-  }, [handleGoogleLogin]);
+  const googleSetupError = useGoogleSignInButton(
+    'googleSignUpButton',
+    'signup_with',
+    handleGoogleLogin
+  );
 
   return (
     <form className="w-full" onSubmit={handleSubmit}>
@@ -265,6 +315,11 @@ export const SignUpForm: React.FC<SignUpFormProps> = ({ startOtpVerification }) 
         {loading ? 'Creating Account...' : 'Sign Up With Email'}
       </Button>
       <div id="googleSignUpButton" className="w-full"></div>
+      {googleSetupError && (
+        <p className="mt-2 text-sm text-red-500" role="alert">
+          {googleSetupError}
+        </p>
+      )}
     </form>
   );
 };
@@ -287,7 +342,7 @@ export const OTPVerificationForm: React.FC<OTPVerificationFormProps> = ({ email,
 
   useEffect(() => {
     clearError();
-  }, []);
+  }, [clearError]);
 
   useEffect(() => {
     if (resendCooldown <= 0) return;
@@ -439,7 +494,7 @@ export const ResetPasswordForm: React.FC<ResetPasswordFormProps> = ({ email, han
 
   useEffect(() => {
     clearError();
-  }, []);
+  }, [clearError]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

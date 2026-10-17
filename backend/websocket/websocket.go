@@ -330,6 +330,7 @@ func WebsocketHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing room parameter"})
 		return
 	}
+	isSpectator := strings.EqualFold(c.Query("spectator"), "true")
 
 	// Get user details from database
 	userID, username, avatarURL, rating, err := getUserDetails(email)
@@ -341,7 +342,10 @@ func WebsocketHandler(c *gin.Context) {
 	// Create the room if it doesn't exist.
 	roomCollection := db.MongoDatabase.Collection("rooms")
 	var persistedRoom struct {
-		OwnerID string `bson:"ownerId"`
+		OwnerID      string `bson:"ownerId"`
+		Participants []struct {
+			ID string `bson:"id"`
+		} `bson:"participants"`
 	}
 	lookupContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -355,11 +359,30 @@ func WebsocketHandler(c *gin.Context) {
 		return
 	}
 
+	if !isSpectator {
+		isParticipant := persistedRoom.OwnerID == userID
+		for _, participant := range persistedRoom.Participants {
+			if participant.ID == userID {
+				isParticipant = true
+				break
+			}
+		}
+		if !isParticipant {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You are not a participant in this room"})
+			return
+		}
+	}
+
+	ownerID := persistedRoom.OwnerID
+	if ownerID == "" && len(persistedRoom.Participants) > 0 {
+		ownerID = persistedRoom.Participants[0].ID
+	}
+
 	roomsMutex.Lock()
 	if _, exists := rooms[roomID]; !exists {
 		rooms[roomID] = &Room{
 			Clients:      make(map[*websocket.Conn]*Client),
-			OwnerID:      persistedRoom.OwnerID,
+			OwnerID:      ownerID,
 			Phase:        setupPhase,
 			DebaterRoles: make(map[string]string),
 		}
@@ -372,25 +395,6 @@ func WebsocketHandler(c *gin.Context) {
 	if err != nil {
 		return
 	}
-
-	// Check if this is a spectator connection (they want to receive video streams)
-	// Allow spectators to connect even if room has 2 debaters
-	isSpectator := strings.EqualFold(c.Query("spectator"), "true")
-	room.Mutex.Lock()
-	currentDebaters := 0
-	for _, existing := range room.Clients {
-		if !existing.IsSpectator {
-			currentDebaters++
-		}
-	}
-	maxDebaters := 2
-	if !isSpectator && currentDebaters >= maxDebaters {
-		room.Mutex.Unlock()
-		log.Printf("[ws] rejecting debater %s for room %s: already full", email, roomID)
-		conn.Close()
-		return
-	}
-	room.Mutex.Unlock()
 
 	if avatarURL == "" {
 		avatarURL = "https://api.dicebear.com/9.x/big-ears/svg?seed=Nolan"
@@ -425,8 +429,37 @@ func WebsocketHandler(c *gin.Context) {
 	// Mark as spectator if needed (we can add a field to Client struct for this)
 	// For now, we'll handle it through the message handlers
 
-	// Send current participants to the new client
+	var replacedConnections []*websocket.Conn
 	room.Mutex.Lock()
+	currentDebaters := 0
+	for existingConn, existing := range room.Clients {
+		if existing.IsSpectator {
+			continue
+		}
+		if !isSpectator && existing.UserID == userID {
+			replacedConnections = append(replacedConnections, existingConn)
+			continue
+		}
+		currentDebaters++
+	}
+	if !isSpectator && currentDebaters >= 2 {
+		room.Mutex.Unlock()
+		log.Printf("[ws] rejecting debater %s for room %s: already full", email, roomID)
+		_ = client.SafeWriteJSON(map[string]interface{}{
+			"type":    "connectionRejected",
+			"message": "This room already has two debaters.",
+		})
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Room is full"),
+			time.Now().Add(time.Second),
+		)
+		_ = conn.Close()
+		return
+	}
+	for _, replacedConn := range replacedConnections {
+		delete(room.Clients, replacedConn)
+	}
 	if !client.IsSpectator && room.Phase != "" && room.Phase != setupPhase {
 		if role, assigned := room.DebaterRoles[userID]; assigned {
 			client.Role = role
@@ -435,13 +468,26 @@ func WebsocketHandler(c *gin.Context) {
 	}
 	room.Clients[conn] = client
 	room.Mutex.Unlock()
+	for _, replacedConn := range replacedConnections {
+		_ = replacedConn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Reconnected from another session"),
+			time.Now().Add(time.Second),
+		)
+		_ = replacedConn.Close()
+	}
 
 	// Send participants list to newly connected client
 	participantsMsg := buildParticipantsMessage(room)
 	client.SafeWriteJSON(participantsMsg)
 
 	// Send existing participants' detailed info to the new client
-	for connRef, existing := range room.Clients {
+	type participantDetails struct {
+		payload map[string]interface{}
+	}
+	room.Mutex.Lock()
+	existingUsers := make([]participantDetails, 0, len(room.Clients))
+	for _, existing := range room.Clients {
 		payload := map[string]interface{}{
 			"id":          existing.UserID,
 			"username":    existing.Username,
@@ -450,17 +496,15 @@ func WebsocketHandler(c *gin.Context) {
 			"avatarUrl":   existing.AvatarURL,
 			"elo":         existing.Elo,
 		}
-		detailMessage := map[string]interface{}{
+		existingUsers = append(existingUsers, participantDetails{payload: payload})
+	}
+	room.Mutex.Unlock()
+	for _, existing := range existingUsers {
+		if err := client.SafeWriteJSON(map[string]interface{}{
 			"type":        "userDetails",
-			"userDetails": payload,
-		}
-
-		if connRef == conn {
-			// Already sent this client's participant data; ensure they have their own detail payload too
-			client.SafeWriteJSON(detailMessage)
-		} else {
-			// Send existing participant info to the new client
-			client.SafeWriteJSON(detailMessage)
+			"userDetails": existing.payload,
+		}); err != nil {
+			log.Printf("[ws] failed to send participant details: room=%s user=%s err=%v", roomID, userID, err)
 		}
 	}
 
@@ -723,6 +767,15 @@ func handlePhaseChange(room *Room, conn *websocket.Conn, message Message, roomID
 		return
 	}
 
+	rejectPhaseChange := func(reason string) {
+		if err := sender.SafeWriteJSON(map[string]interface{}{
+			"type":    "phaseChangeRejected",
+			"message": reason,
+		}); err != nil {
+			log.Printf("[ws] failed to send phase rejection: room=%s user=%s err=%v", roomID, sender.UserID, err)
+		}
+	}
+
 	currentPhase := room.Phase
 	if currentPhase == "" {
 		currentPhase = setupPhase
@@ -730,6 +783,7 @@ func handlePhaseChange(room *Room, conn *websocket.Conn, message Message, roomID
 	expectedPhase, hasNextPhase := nextDebatePhase(currentPhase)
 	if !hasNextPhase || message.Phase != expectedPhase {
 		room.Mutex.Unlock()
+		rejectPhaseChange("The requested phase is not the next phase in this debate.")
 		return
 	}
 
@@ -738,11 +792,13 @@ func handlePhaseChange(room *Room, conn *websocket.Conn, message Message, roomID
 		expectedRole = "for"
 		if !canStartDebateLocked(room) {
 			room.Mutex.Unlock()
+			rejectPhaseChange("Both players must select different roles and be ready before the debate can start.")
 			return
 		}
 	}
 	if expectedRole == "" || sender.Role != expectedRole {
 		room.Mutex.Unlock()
+		rejectPhaseChange("Only the player whose turn is ending can advance the debate.")
 		return
 	}
 
@@ -815,11 +871,29 @@ func handleTopicChange(room *Room, conn *websocket.Conn, message Message, roomID
 func handleRoleSelection(room *Room, conn *websocket.Conn, message Message, roomID string) {
 	room.Mutex.Lock()
 	client, exists := room.Clients[conn]
-	if !exists || client.IsSpectator || (room.Phase != "" && room.Phase != setupPhase) || (message.Role != "for" && message.Role != "against") {
+	if !exists || client.IsSpectator {
 		room.Mutex.Unlock()
 		return
 	}
+	if (room.Phase != "" && room.Phase != setupPhase) || (message.Role != "for" && message.Role != "against") {
+		room.Mutex.Unlock()
+		return
+	}
+	for _, other := range room.Clients {
+		if other != client && !other.IsSpectator && other.Role == message.Role {
+			room.Mutex.Unlock()
+			if err := client.SafeWriteJSON(map[string]interface{}{
+				"type":    "roleSelectionRejected",
+				"role":    client.Role,
+				"message": "Your opponent has already selected that side.",
+			}); err != nil {
+				log.Printf("[ws] failed to send role rejection: room=%s user=%s err=%v", roomID, client.UserID, err)
+			}
+			return
+		}
+	}
 	client.Role = message.Role
+	message.UserID = client.UserID
 	room.Mutex.Unlock()
 
 	// Broadcast role selection to other clients
@@ -842,6 +916,19 @@ func handleReadyStatus(room *Room, conn *websocket.Conn, message Message, roomID
 	client, exists := room.Clients[conn]
 	if !exists || client.IsSpectator {
 		room.Mutex.Unlock()
+		return
+	}
+	if *message.Ready && (client.Role != "for" && client.Role != "against") {
+		currentReady := client.Ready
+		userID := client.UserID
+		room.Mutex.Unlock()
+		if err := client.SafeWriteJSON(map[string]interface{}{
+			"type":    "readyRejected",
+			"ready":   currentReady,
+			"message": "Select a debate side before marking yourself ready.",
+		}); err != nil {
+			log.Printf("[ws] failed to send ready rejection: room=%s user=%s err=%v", roomID, userID, err)
+		}
 		return
 	}
 	client.Ready = *message.Ready
@@ -922,6 +1009,23 @@ func getUserDetails(email string) (string, string, string, int, error) {
 
 // handleConcede handles concede requests
 func handleConcede(room *Room, conn *websocket.Conn, message Message, client *Client, roomID string) {
+	room.Mutex.Lock()
+	registeredClient, exists := room.Clients[conn]
+	if !exists || registeredClient.IsSpectator || room.Phase == "" || room.Phase == setupPhase || room.Phase == "finished" {
+		room.Mutex.Unlock()
+		return
+	}
+	client = registeredClient
+	room.Phase = "finished"
+	var opponent *Client
+	for _, participant := range room.Clients {
+		if !participant.IsSpectator && participant.UserID != client.UserID {
+			opponent = participant
+			break
+		}
+	}
+	room.Mutex.Unlock()
+
 	// Broadcast concede message to all clients (including spectators)
 	broadcastMessage := Message{
 		Type:     "concede",
@@ -933,19 +1037,10 @@ func handleConcede(room *Room, conn *websocket.Conn, message Message, client *Cl
 
 	// Send to all clients
 	for _, r := range snapshotRecipients(room, nil) {
-		r.SafeWriteJSON(broadcastMessage)
-	}
-
-	// Find opponent
-	var opponent *Client
-	room.Mutex.Lock()
-	for _, c := range room.Clients {
-		if !c.IsSpectator && c.UserID != client.UserID {
-			opponent = c
-			break
+		if err := r.SafeWriteJSON(broadcastMessage); err != nil {
+			log.Printf("[ws] failed to broadcast concede: room=%s user=%s err=%v", roomID, client.UserID, err)
 		}
 	}
-	room.Mutex.Unlock()
 
 	if opponent != nil {
 		// Update ratings
@@ -955,7 +1050,7 @@ func handleConcede(room *Room, conn *websocket.Conn, message Message, client *Cl
 
 		_, _, err := services.UpdateRatings(userID, opponentID, 0.0, time.Now())
 		if err != nil {
-			log.Printf("Error updating ratings after concede: %v", err)
+			log.Printf("[ws] failed to update ratings after concede: room=%s user=%s opponent=%s err=%v", roomID, client.UserID, opponent.UserID, err)
 		}
 	}
 }
